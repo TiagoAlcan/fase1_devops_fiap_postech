@@ -8,6 +8,100 @@ A **DevOps Solutions Inc.** precisa de uma forma para que seus times de desenvol
 
 Nesta primeira fase, nosso foco é criar e implantar o MVP (Produto Mínimo Viável) da plataforma, que consiste em uma API monolítica simples para gerenciar as *feature flags*.
 
+---
+
+## 📦 Entrega do Grupo
+
+### 👥 Integrantes
+
+| Nome                   | RM       |
+| :--------------------- | :------- |
+| Gabriel Coutinho       | rm377693 |
+| Tiago Alcântara        | rm378125 |
+| Caue Ferreira          | rm378843 |
+| Paulo Henrique Silva   | rm377492 |
+| Rafael Broglia Szyszko | rm378642 |
+
+### 🔗 Links
+
+- 🎥 **Vídeo de demonstração:** https://youtu.be/a-g04HLmb8A
+- 🗺️ **Diagrama de arquitetura (Miro):** https://miro.com/app/board/uXjVHnfvT98=/
+- 📄 **Diagrama em PDF:** [Arquitetura Cloud - AWS.pdf](<Arquitetura Cloud - AWS.pdf>)
+- 📝 **Relatório completo:** [Relatório-Fiap-1_fase.pdf](<Relatório-Fiap-1_fase.pdf>)
+- 🧱 **Arquitetura local e do monolito:** [ARCHITECTURE.md](ARCHITECTURE.md)
+
+### ☁️ Arquitetura Cloud na AWS
+
+```mermaid
+flowchart TB
+    user(["Usuário"]) --> igw["Internet Gateway"]
+    subgraph vpc["VPC 10.0.0.0/16"]
+        subgraph pub["Sub-rede pública"]
+            subgraph sgec2["Security Group · EC2<br/>5000 (API) aberta · 22 (SSH) só IPs do grupo"]
+                ec2["Amazon EC2 · t3.micro<br/>Flask + Gunicorn"]
+            end
+        end
+        subgraph priv["Sub-rede privada"]
+            subgraph sgrds["Security Group · RDS<br/>5432 apenas a partir do SG da EC2"]
+                rds[("Amazon RDS<br/>PostgreSQL")]
+            end
+        end
+    end
+    igw -- ":5000 / :22" --> ec2
+    ec2 -- "PostgreSQL :5432" --> rds
+```
+
+A aplicação roda em uma **EC2 (t3.micro)** em sub-rede **pública**, acessível pela internet através do **Internet Gateway** na porta `5000`. O banco **RDS PostgreSQL** fica em sub-rede **privada**, sem acesso público. A segurança é feita em camadas pelos **Security Groups**:
+
+- **SG da EC2:** libera a porta `5000` (API) e a porta `22` (SSH) somente para os IPs dos integrantes do grupo.
+- **SG do RDS:** libera a porta `5432` **apenas** para o Security Group da EC2, ou seja, só a aplicação conversa com o banco.
+
+As credenciais do banco não ficam no código: a aplicação lê `DB_HOST`, `DB_NAME`, `DB_USER` e `DB_PASSWORD` de variáveis de ambiente.
+
+**Estimativa de custo** (AWS Pricing Calculator, us-east-1, uso contínuo): **~28,64 USD/mês** · **~343,68 USD/ano** (EC2 ≈ 14,66 USD, RDS ≈ 13,98 USD, VPC sem custo).
+
+![Estimativa de custos AWS](Screenshot_1.png)
+
+### ✅ Análise 12-Factor App
+
+Avaliamos o projeto contra os 12 fatores, considerando o ambiente local (Docker Compose) e o de produção (EC2 + RDS). Resultado: **8 atendem**, **3 atendem parcialmente** e **1 não atende**.
+
+| #    | Fator                     | Status     | Motivo principal                                                                                    |
+| :--- | :------------------------ | :--------- | :-------------------------------------------------------------------------------------------------- |
+| I    | Base de código            | ✅ Atende   | Um único repositório Git para um único app; vários deploys a partir dele.                           |
+| II   | Dependências              | ✅ Atende   | Versões fixas no `requirements.txt`, isoladas em contêiner/`venv`.                                  |
+| III  | Configurações             | ✅ Atende   | Credenciais e conexão do banco lidas de variáveis de ambiente.                                      |
+| IV   | Serviços de apoio         | ✅ Atende   | PostgreSQL local e RDS são trocados só por configuração.                                            |
+| V    | Build, release, run       | ❌ Não atende | Em produção o build acontece no próprio servidor (`git clone` + `pip install`); sem releases versionadas. |
+| VI   | Processos                 | ✅ Atende   | App stateless; todo estado fica no PostgreSQL.                                                      |
+| VII  | Vínculo de porta          | ✅ Atende   | Gunicorn expõe HTTP na porta 5000, sem servidor web externo.                                        |
+| VIII | Concorrência              | ⚠️ Parcial  | Pode escalar horizontalmente, mas roda com 1 worker e sem gerenciador de processos.                |
+| IX   | Descartabilidade          | ⚠️ Parcial  | Boot rápido e `exec` recebe SIGTERM, mas na EC2 o processo morre ao fechar o SSH.                   |
+| X    | Paridade dev/prod         | ⚠️ Parcial  | Mesmo banco, mas local roda em contêiner e produção direto no SO, sem o `entrypoint.sh`.            |
+| XI   | Logs                      | ✅ Atende   | Saída em stdout/stderr sem buffer.                                                                  |
+| XII  | Processos de administração | ✅ Atende  | `flask init-db` roda como processo pontual, com o mesmo código e config.                            |
+
+> **Achado crítico:** seguindo o guia manual de deploy na EC2, a tabela `flags` nunca é criada, pois `flask init-db` só é chamado pelo `entrypoint.sh` (usado no Docker). É preciso rodar `flask init-db` manualmente antes do Gunicorn.
+
+**Plano de ação priorizado:** incluir `flask init-db` no deploy da EC2; criar `.gitignore`/`.dockerignore`; rodar o Gunicorn sob `systemd` com `--workers` configurável; trocar `print` por `logging` e parar de expor `str(e)` nas respostas; e, no médio prazo, um pipeline de CI que publique a imagem no ECR com tag versionada.
+
+### 🏗️ Uso do Terraform
+
+Além do deploy manual, o grupo adotou **Infraestrutura como Código** com Terraform (pasta [`terraform/`](terraform/)), que cria todos os recursos do diagrama a partir de código, em vez de cliques no console. Isso também resolveu vários pontos levantados na análise 12-Factor:
+
+- **Rede:** VPC, Internet Gateway, sub-redes públicas e privadas em duas AZs (o RDS exige um *subnet group* com pelo menos duas AZs) e tabelas de rotas.
+- **Segurança:** Security Groups como no diagrama, SSH restrito a IPs `/32` (o `0.0.0.0/0` é bloqueado por validação), IMDSv2 obrigatório e disco da EC2 criptografado.
+- **Credenciais:** a senha do RDS é gerada e guardada no **AWS Secrets Manager**; a EC2 lê o segredo via IAM Role, sem senha em texto no código ou no `tfvars`.
+- **Deploy automático (`user_data`):** instala dependências, clona o app, espera o RDS ficar disponível, executa `flask init-db` (resolve o achado crítico) e sobe o Gunicorn com 2 workers como serviço **systemd** com `Restart=always` (melhora os fatores VIII e IX).
+
+Para o grupo, foi também uma oportunidade de aprender IaC com um integrante que já tinha experiência com a ferramenta. As instruções de uso estão na seção **Infraestrutura como Código (Terraform)** mais abaixo.
+
+### 🧩 Desafios e decisões
+
+- **12-Factor App:** a classificação de cada fator gerou discussão até chegarmos a um consenso.
+- **Plano de ação:** priorizar as ações e estimar o esforço de cada uma a partir das lacunas encontradas.
+- **Terraform:** parte do grupo ainda não conhecia IaC; estruturar e entender o código foi um desafio superado com o apoio de quem já dominava a ferramenta.
+
 ## 🎯 Objetivos da Fase 1
 
 O objetivo principal é aplicar os conceitos fundamentais de DevOps e Cloud. Ao final desta fase, você deverá ser capaz de:
@@ -292,6 +386,42 @@ Você deve entregar os seguintes itens:
     - Nomes dos participantes.
     - Link para o vídeo e para a documentação.
     - Resumo dos desafios encontrados e das decisões tomadas.
+
+## 🏗️ Infraestrutura como Código (Terraform)
+
+A pasta [`terraform/`](terraform/) provisiona toda a infraestrutura na AWS (VPC, sub-redes, Security Groups, EC2, RDS PostgreSQL e IAM) e faz o deploy da aplicação automaticamente via `user_data`.
+
+### Observações
+
+Se quiser testar, é preciso criar um arquivo chamado `terraform.tfvars` dentro da pasta `terraform/` com, no mínimo, as variáveis abaixo:
+
+```hcl
+aws_region  = "x"
+aws_profile = "x"
+
+ssh_allowed_cidrs = [
+  "xxx.xxx.xxx.xxx/32",
+]
+
+ssh_public_key = "ssh-ed xxxxxxx"
+
+ssh_extra_public_keys = []
+```
+
+> O arquivo `terraform.tfvars` está no `.gitignore` e **não deve ser versionado**.
+
+Depois, basta executar:
+
+```bash
+cd terraform
+terraform init
+terraform plan
+terraform apply
+```
+
+Para remover os recursos ao final: `terraform destroy`.
+
+---
 
 ## 💡 Dicas e Pontos de Atenção
 
